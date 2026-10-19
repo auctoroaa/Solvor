@@ -41,8 +41,8 @@ jobs:
           wasm-bindgen --target web --out-dir dist/verifier --out-name verifier target/wasm32-unknown-unknown/release/zero_verifier.wasm
       - name: Optimize WebAssembly
         run: |
-          wasm-opt dist/axiom/axiom_core_bg.wasm -O4 -o dist/axiom/axiom_core_opt.wasm
-          wasm-opt dist/verifier/verifier_bg.wasm -O4 -o dist/verifier/verifier_opt.wasm
+          wasm-opt --enable-bulk-memory --enable-sign-ext dist/axiom/axiom_core_bg.wasm -O4 -o dist/axiom/axiom_core_opt.wasm
+          wasm-opt --enable-bulk-memory --enable-sign-ext dist/verifier/verifier_bg.wasm -O4 -o dist/verifier/verifier_opt.wasm
       - name: Verify outputs
         run: |
           test -s dist/axiom/axiom_core.d.ts
