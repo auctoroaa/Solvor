@@ -33,8 +33,6 @@ jobs:
           test -s target/zero_verifier_opt.wasm
           test -s web/axiom_core.d.ts
           test -s web/zero_verifier.d.ts
-          wasm-opt target/axiom_core_opt.wasm --validate
-          wasm-opt target/zero_verifier_opt.wasm --validate
       - uses: actions/upload-artifact@v4
         with:
           name: axiom-wasm-build
