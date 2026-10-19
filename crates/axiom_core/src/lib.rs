@@ -19,3 +19,20 @@ pub fn shader_source() -> String {
 pub fn evaluate_transition(state: u32, input: u32) -> u32 {
     state.rotate_left(5) ^ input.wrapping_mul(0x9E37_79B9)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposes_version_and_shader() {
+        assert_eq!(axiom_version(), env!("CARGO_PKG_VERSION"));
+        assert!(shader_source().contains("@compute"));
+    }
+
+    #[test]
+    fn transition_is_deterministic() {
+        assert_eq!(evaluate_transition(7, 11), evaluate_transition(7, 11));
+        assert_ne!(evaluate_transition(7, 11), evaluate_transition(7, 12));
+    }
+}
