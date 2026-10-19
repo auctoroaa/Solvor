@@ -1,6 +1,7 @@
 #pragma once
 #include "axiom/axiom_core.hpp"
 #include <list>
+#include <stdexcept>
 #include <unordered_map>
 
 namespace axiom {
