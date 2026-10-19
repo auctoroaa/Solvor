@@ -1,7 +1,7 @@
 #include "axiom/axiom_core.hpp"
 #include <cassert>
 #include <filesystem>
-#include <iostream>
+#include <iostream>\n#include <fstream>
 #include <stdexcept>
 using namespace axiom;
 int main() {
@@ -14,6 +14,20 @@ int main() {
   std::string error; assert(engine.build_graph({b,a},error));
   auto r=engine.execute_tick(); assert(r.ok && r.tick==1 && engine.verify());
   Tile got{}; assert(engine.get_tile(1,got) && got[0]==4); assert(engine.get_tile(2,got) && got[0]==8);
+  {
+    AxiomEngine restarted(root);
+    assert(restarted.current_tick()==1 && restarted.verify());
+    Tile persisted{}; assert(restarted.get_tile(1,persisted) && persisted[0]==4);
+    assert(restarted.get_tile(2,persisted) && persisted[0]==8);
+  }
+  {
+    std::ofstream torn(root/"axiom.wal",std::ios::binary|std::ios::app);
+    torn.write("AXW",3);
+  }
+  {
+    AxiomEngine repaired(root);
+    assert(repaired.current_tick()==1 && repaired.verify());
+  }
   Task bad{30,{}, {}, {1}, [](const State&, State&){ throw std::runtime_error("intentional failure"); }};
   assert(engine.build_graph({bad},error)); auto before=engine.state().at(1); auto failed=engine.execute_tick();
   assert(!failed.ok && engine.current_tick()==1 && engine.state().at(1)==before);
