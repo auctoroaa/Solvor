@@ -56,6 +56,8 @@ class AxiomEngine {
   std::uint64_t tick_{};
   Digest last_digest_{};
   ZeroVerifier verifier_;
-  bool append_commit(std::uint64_t tick, const Digest& before, const Digest& after, std::string& error);
+  bool recover(std::string& error);
+  bool append_commit(std::uint64_t tick, const State& before_state, const State& after_state,
+                     const Digest& before, const Digest& after, std::string& error);
 };
 } // namespace axiom
