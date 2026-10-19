@@ -1,34 +1,40 @@
-# AXIOM Reality Engine: Single-File Source Bundle
+# AXIOM Reality Engine Core
 
-This Markdown file consolidates the current AXIOM C++20 core source, build configuration, test source, and CI workflow from `auctoroaa/Solvor`.
+Consolidated source file for the current C++20 implementation in `auctoroaa/Solvor`.
 
-## Build status
+> Status: C++ core with WAL recovery and a tested bounded-cache primitive. The cache is not yet integrated as the engine's backing store. WAL segment rotation, full StatePager integration, and optional io_uring remain unfinished. This document does not claim production completeness.
 
-GitHub Actions run: https://github.com/auctoroaa/Solvor/actions/runs/39340220134
+## README
 
-The C++ target compiled and its current test suite passed in that run. The artifact is available from the run's **Artifacts** section as `axiom-cpp-core-linux`.
-
-## Scope
-
-This is the currently compiled core, not the entire originally specified production engine. Implemented in this bundle: deterministic DAG layering, stable task order, declared tile-access conflict checks, transactional in-memory tick updates, rollback on task exceptions, SHA-256 state digests, hash-chain verification, and fsync-backed commit records.
-
-Still not implemented in this bundle: bounded LRU/pinning TileCache, full event WAL and segment rotation, replay/torn-write repair, persisted tile state and clean-tick recovery, and the optional liburing backend. Those are not claimed as completed.
+```text
+# AXIOM C++20 Engine Core
 
 ## Build and test
 
-Requires a Linux environment with C++20 compiler, CMake 3.20+, and OpenSSL development headers.
-
 ```sh
 cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
-cmake --build engine/build --parallel 2
+cmake --build engine/build --parallel
 ctest --test-dir engine/build --output-on-failure
 ```
 
-When extracting the sections below, save each code block to its stated repository path. This is one Markdown document containing the current source, not a binary executable.
+## Implemented and tested
 
-## Build configuration
+- Deterministic DAG layering and stable task ordering.
+- Declared tile-access conflict checks and transactional tick updates.
+- Rollback when a task fails before commit.
+- SHA-256 state digests and a deterministic hash-chain verifier.
+- CRC32C-protected binary write-ahead log records with fsync before a tick is accepted.
+- CRC32C-protected, atomically replaced genesis state for initial tiles.
+- Restart recovery that validates tick order, before/after state digests, record CRCs, and truncates an incomplete or invalid WAL tail.
+- Bounded LRU `TileCache` primitive with pin-aware eviction and tests.
 
-**Repository path:** `engine/CMakeLists.txt`
+## Remaining integration work
+
+The cache is currently a tested primitive, not yet the engine's backing store. The engine still keeps its active state in an in-memory map. WAL segment rotation, a complete StatePager that pages state through the bounded cache, optional io_uring I/O, and broader fault-injection/concurrency testing remain unfinished. Do not treat this as the complete production AXIOM Reality Engine yet.
+
+```
+
+## CMake build
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -45,11 +51,10 @@ add_executable(test_axiom tests/test_axiom.cpp)
 target_link_libraries(test_axiom PRIVATE axiom_core)
 enable_testing()
 add_test(NAME axiom_core_tests COMMAND test_axiom)
+
 ```
 
-## Public API
-
-**Repository path:** `engine/include/axiom/axiom_core.hpp`
+## Core API
 
 ```cpp
 #pragma once
@@ -110,20 +115,111 @@ class AxiomEngine {
   std::uint64_t tick_{};
   Digest last_digest_{};
   ZeroVerifier verifier_;
-  bool append_commit(std::uint64_t tick, const Digest& before, const Digest& after, std::string& error);
+  bool recover(std::string& error);
+  bool persist_genesis(std::string& error) const;
+  bool append_commit(std::uint64_t tick, const State& before_state, const State& after_state,
+                     const Digest& before, const Digest& after, std::string& error);
 };
 } // namespace axiom
+
 ```
 
-## Implementation
+## Bounded tile cache
 
-**Repository path:** `engine/src/axiom_core.cpp`
+```cpp
+#pragma once
+#include "axiom/axiom_core.hpp"
+#include <list>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace axiom {
+
+// Bounded LRU cache for 4 KiB tiles. Pinned entries cannot be evicted.
+// The backing store remains responsible for loading a miss and persisting dirty data.
+class TileCache {
+ public:
+  explicit TileCache(std::size_t capacity) : capacity_(capacity) {
+    if (capacity_ == 0) throw std::invalid_argument("tile cache capacity must be nonzero");
+  }
+  std::size_t capacity() const noexcept { return capacity_; }
+  std::size_t size() const noexcept { return entries_.size(); }
+  bool contains(std::uint64_t id) const { return entries_.find(id) != entries_.end(); }
+
+  bool get(std::uint64_t id, Tile& out) {
+    auto it=entries_.find(id);
+    if(it==entries_.end()) return false;
+    touch(it); out=it->second.tile; return true;
+  }
+
+  // Returns false only when every resident entry is pinned and capacity is full.
+  bool put(std::uint64_t id, const Tile& tile) {
+    auto found=entries_.find(id);
+    if(found!=entries_.end()) {
+      found->second.tile=tile; touch(found); return true;
+    }
+    if(entries_.size()==capacity_ && !evict_one()) return false;
+    order_.push_front(id);
+    entries_.emplace(id,Entry{tile,order_.begin(),0});
+    return true;
+  }
+
+  bool pin(std::uint64_t id) {
+    auto it=entries_.find(id); if(it==entries_.end()) return false;
+    ++it->second.pins; touch(it); return true;
+  }
+  bool unpin(std::uint64_t id) {
+    auto it=entries_.find(id);
+    if(it==entries_.end() || it->second.pins==0) return false;
+    --it->second.pins; return true;
+  }
+  std::size_t pin_count(std::uint64_t id) const {
+    auto it=entries_.find(id); return it==entries_.end()?0:it->second.pins;
+  }
+  bool erase(std::uint64_t id) {
+    auto it=entries_.find(id);
+    if(it==entries_.end() || it->second.pins!=0) return false;
+    order_.erase(it->second.position); entries_.erase(it); return true;
+  }
+
+ private:
+  struct Entry { Tile tile; std::list<std::uint64_t>::iterator position; std::size_t pins; };
+  using Iterator=std::unordered_map<std::uint64_t,Entry>::iterator;
+  std::size_t capacity_;
+  std::list<std::uint64_t> order_;
+  std::unordered_map<std::uint64_t,Entry> entries_;
+
+  void touch(Iterator it) {
+    order_.erase(it->second.position);
+    order_.push_front(it->first);
+    it->second.position=order_.begin();
+  }
+  bool evict_one() {
+    for(auto it=order_.rbegin();it!=order_.rend();++it) {
+      auto entry=entries_.find(*it);
+      if(entry!=entries_.end() && entry->second.pins==0) {
+        auto erase_position=std::next(it).base();
+        order_.erase(erase_position); entries_.erase(entry); return true;
+      }
+    }
+    return false;
+  }
+};
+} // namespace axiom
+
+```
+
+## Core implementation
 
 ```cpp
 #include "axiom/axiom_core.hpp"
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <openssl/sha.h>
 #include <sstream>
 #include <stdexcept>
@@ -131,6 +227,37 @@ class AxiomEngine {
 #include <unistd.h>
 
 namespace axiom {
+namespace {
+constexpr std::array<std::uint8_t,8> WAL_MAGIC{'A','X','W','A','L','0','0','1'};
+constexpr std::array<std::uint8_t,8> GEN_MAGIC{'A','X','G','E','N','0','0','1'};
+void put_u64(std::vector<std::uint8_t>& out, std::uint64_t v) {
+  for (int i=0;i<8;++i) out.push_back(static_cast<std::uint8_t>(v>>(i*8)));
+}
+std::uint64_t get_u64(const std::uint8_t* p) {
+  std::uint64_t v=0; for(int i=0;i<8;++i) v|=std::uint64_t(p[i])<<(i*8); return v;
+}
+std::uint32_t crc32c(const std::uint8_t* data, std::size_t n) {
+  std::uint32_t crc=~std::uint32_t{0};
+  for(std::size_t i=0;i<n;++i) {
+    crc^=data[i];
+    for(int b=0;b<8;++b) crc=(crc>>1)^(0x82f63b78u & (0u-(crc&1u)));
+  }
+  return ~crc;
+}
+void put_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+  for(int i=0;i<4;++i) out.push_back(static_cast<std::uint8_t>(v>>(i*8)));
+}
+bool write_all(int fd,const std::uint8_t* p,std::size_t n) {
+  std::size_t done=0;
+  while(done<n) {
+    auto w=::write(fd,p+done,n-done);
+    if(w<0) { if(errno==EINTR) continue; return false; }
+    if(w==0) return false;
+    done+=static_cast<std::size_t>(w);
+  }
+  return true;
+}
+}
 Digest sha256(const std::uint8_t* data, std::size_t size) {
   Digest out{}; SHA256(data, size, out.data()); return out;
 }
@@ -174,10 +301,25 @@ AxiomEngine::AxiomEngine(std::filesystem::path storage_root) : root_(std::move(s
   if (!root_.empty()) {
     std::error_code ec; std::filesystem::create_directories(root_, ec);
     if(ec) throw std::runtime_error("cannot create storage root: "+ec.message());
+    std::string error;
+    if(!recover(error)) throw std::runtime_error("AXIOM WAL recovery failed: "+error);
   }
   last_digest_=state_digest(state_);
 }
-void AxiomEngine::set_tile(std::uint64_t id, const Tile& tile) { state_[id]=tile; last_digest_=state_digest(state_); }
+void AxiomEngine::set_tile(std::uint64_t id, const Tile& tile) {
+  auto previous=state_.find(id);
+  const bool existed=previous!=state_.end();
+  Tile old{}; if(existed) old=previous->second;
+  state_[id]=tile;
+  if(!root_.empty() && tick_==0) {
+    std::string error;
+    if(!persist_genesis(error)) {
+      if(existed) state_[id]=old; else state_.erase(id);
+      throw std::runtime_error("persist genesis failed: "+error);
+    }
+  }
+  last_digest_=state_digest(state_);
+}
 bool AxiomEngine::get_tile(std::uint64_t id, Tile& out) const {
   auto it=state_.find(id); if(it==state_.end()) return false; out=it->second; return true;
 }
@@ -216,20 +358,132 @@ bool AxiomEngine::build_graph(const std::vector<Task>& tasks, std::string& error
   }
   tasks_=tasks; return true;
 }
-bool AxiomEngine::append_commit(std::uint64_t tick,const Digest& before,const Digest& after,std::string& error) {
-  if(root_.empty()) return true;
-  const auto path=root_/"commits.log";
-  int fd=::open(path.c_str(),O_CREAT|O_WRONLY|O_APPEND,0644);
-  if(fd<0) { error="open commit log failed"; return false; }
-  std::ostringstream line; line<<tick<<' '<<hex(before)<<' '<<hex(after)<<'\n'; auto s=line.str();
-  std::size_t done=0;
-  while(done<s.size()) {
-    auto n=::write(fd,s.data()+done,s.size()-done);
-    if(n<0) { ::close(fd); error="write commit log failed"; return false; }
-    done+=static_cast<std::size_t>(n);
+bool AxiomEngine::persist_genesis(std::string& error) const {
+  error.clear();
+  std::vector<std::uint8_t> bytes;
+  bytes.insert(bytes.end(),GEN_MAGIC.begin(),GEN_MAGIC.end()); put_u64(bytes,state_.size());
+  for(const auto& [id,tile]:state_) {
+    put_u64(bytes,id); bytes.insert(bytes.end(),tile.begin(),tile.end());
   }
-  if(::fsync(fd)!=0) { ::close(fd); error="fsync commit log failed"; return false; }
-  if(::close(fd)!=0) { error="close commit log failed"; return false; }
+  put_u32(bytes,crc32c(bytes.data(),bytes.size()));
+  const auto path=root_/"axiom.genesis";
+  const auto temp=root_/"axiom.genesis.tmp";
+  int fd=::open(temp.c_str(),O_CREAT|O_TRUNC|O_WRONLY,0644);
+  if(fd<0) { error="open genesis temp failed"; return false; }
+  const bool wrote=write_all(fd,bytes.data(),bytes.size());
+  const bool synced=wrote && ::fsync(fd)==0;
+  const int closed=::close(fd);
+  if(!wrote || !synced || closed!=0) { error="write/fsync genesis failed"; return false; }
+  std::error_code ec; std::filesystem::rename(temp,path,ec);
+  if(ec) { error="rename genesis failed: "+ec.message(); return false; }
+  int dirfd=::open(root_.c_str(),O_RDONLY|O_DIRECTORY);
+  if(dirfd>=0) { const bool ok=::fsync(dirfd)==0; ::close(dirfd); if(!ok) { error="fsync genesis directory failed"; return false; } }
+  return true;
+}
+bool AxiomEngine::recover(std::string& error) {
+  error.clear();
+  State genesis;
+  const auto genesis_path=root_/"axiom.genesis";
+  if(std::filesystem::exists(genesis_path)) {
+    std::ifstream gen(genesis_path,std::ios::binary);
+    if(!gen) { error="cannot open genesis state"; return false; }
+    std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(gen)),{});
+    constexpr std::size_t header=16, entry=8+TILE_BYTES, trailer=4;
+    if(data.size()<header+trailer || !std::equal(GEN_MAGIC.begin(),GEN_MAGIC.end(),data.begin())) {
+      error="invalid genesis header"; return false;
+    }
+    const auto count=get_u64(data.data()+8);
+    if(count>(std::numeric_limits<std::size_t>::max()-header-trailer)/entry ||
+       data.size()!=header+static_cast<std::size_t>(count)*entry+trailer) {
+      error="invalid genesis length"; return false;
+    }
+    const auto n=data.size();
+    const auto stored=static_cast<std::uint32_t>(data[n-4]) |
+      (static_cast<std::uint32_t>(data[n-3])<<8) |
+      (static_cast<std::uint32_t>(data[n-2])<<16) |
+      (static_cast<std::uint32_t>(data[n-1])<<24);
+    if(crc32c(data.data(),n-4)!=stored) { error="genesis CRC32C mismatch"; return false; }
+    std::size_t off=header;
+    for(std::uint64_t i=0;i<count;++i) {
+      const auto id=get_u64(data.data()+off); off+=8;
+      Tile tile{}; std::copy(data.begin()+static_cast<std::ptrdiff_t>(off),
+                             data.begin()+static_cast<std::ptrdiff_t>(off+TILE_BYTES),tile.begin());
+      off+=TILE_BYTES;
+      if(!genesis.emplace(id,tile).second) { error="duplicate tile in genesis"; return false; }
+    }
+  }
+  const auto path=root_/"axiom.wal";
+  std::ifstream in(path,std::ios::binary);
+  std::vector<std::uint8_t> bytes;
+  if(in) bytes.assign(std::istreambuf_iterator<char>(in),{});
+  else if(std::filesystem::exists(path)) { error="cannot open WAL"; return false; }
+  std::size_t pos=0,valid_end=0;
+  State recovered=genesis;
+  std::uint64_t recovered_tick=0;
+  ZeroVerifier recovered_verifier;
+  while(pos<bytes.size()) {
+    constexpr std::size_t fixed=8+8+32+32+8;
+    if(bytes.size()-pos<fixed) break;
+    const auto* p=bytes.data()+pos;
+    if(!std::equal(WAL_MAGIC.begin(),WAL_MAGIC.end(),p)) break;
+    const auto tick=get_u64(p+8);
+    Digest before{},after{};
+    std::copy(p+16,p+48,before.begin()); std::copy(p+48,p+80,after.begin());
+    const auto count=get_u64(p+80);
+    if(count>(std::numeric_limits<std::size_t>::max()-fixed-4)/(8+TILE_BYTES)) break;
+    const std::size_t record_size=fixed+static_cast<std::size_t>(count)*(8+TILE_BYTES)+4;
+    if(bytes.size()-pos<record_size) break;
+    const auto stored_crc=static_cast<std::uint32_t>(bytes[pos+record_size-4]) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-3])<<8) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-2])<<16) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-1])<<24);
+    if(crc32c(p,record_size-4)!=stored_crc || tick!=recovered_tick+1 ||
+       state_digest(recovered)!=before) break;
+    State next=recovered;
+    std::size_t off=pos+fixed;
+    for(std::uint64_t i=0;i<count;++i) {
+      const auto id=get_u64(bytes.data()+off); off+=8;
+      Tile tile{}; std::copy(bytes.begin()+static_cast<std::ptrdiff_t>(off),
+                             bytes.begin()+static_cast<std::ptrdiff_t>(off+TILE_BYTES),tile.begin());
+      off+=TILE_BYTES; next[id]=tile;
+    }
+    if(state_digest(next)!=after || !recovered_verifier.record(tick,after)) break;
+    recovered=std::move(next); recovered_tick=tick; pos+=record_size; valid_end=pos;
+  }
+  if(valid_end<bytes.size()) {
+    int fd=::open(path.c_str(),O_WRONLY);
+    if(fd<0) { error="cannot open torn WAL for truncation"; return false; }
+    const bool ok=::ftruncate(fd,static_cast<off_t>(valid_end))==0 && ::fsync(fd)==0;
+    const int close_result=::close(fd);
+    if(!ok || close_result!=0) { error="failed to truncate torn WAL tail"; return false; }
+  }
+  state_=std::move(recovered); tick_=recovered_tick; verifier_=std::move(recovered_verifier);
+  last_digest_=state_digest(state_);
+  return true;
+}
+bool AxiomEngine::append_commit(std::uint64_t tick,const State& before_state,const State& after_state,
+                                const Digest& before,const Digest& after,std::string& error) {
+  if(root_.empty()) return true;
+  std::vector<std::uint8_t> record;
+  record.insert(record.end(),WAL_MAGIC.begin(),WAL_MAGIC.end()); put_u64(record,tick);
+  record.insert(record.end(),before.begin(),before.end()); record.insert(record.end(),after.begin(),after.end());
+  std::vector<std::pair<std::uint64_t,const Tile*>> changed;
+  for(const auto& [id,tile]:after_state) {
+    auto old=before_state.find(id);
+    if(old==before_state.end() || old->second!=tile) changed.emplace_back(id,&tile);
+  }
+  put_u64(record,changed.size());
+  for(const auto& [id,tile]:changed) {
+    put_u64(record,id); record.insert(record.end(),tile->begin(),tile->end());
+  }
+  put_u32(record,crc32c(record.data(),record.size()));
+  const auto path=root_/"axiom.wal";
+  int fd=::open(path.c_str(),O_CREAT|O_WRONLY|O_APPEND,0644);
+  if(fd<0) { error="open WAL failed"; return false; }
+  const bool wrote=write_all(fd,record.data(),record.size());
+  const bool synced=wrote && ::fsync(fd)==0;
+  const int closed=::close(fd);
+  if(!wrote || !synced || closed!=0) { error="WAL write/fsync/close failed"; return false; }
   return true;
 }
 TickResult AxiomEngine::execute_tick() {
@@ -249,24 +503,25 @@ TickResult AxiomEngine::execute_tick() {
       for(auto& [tile,data]:writes) working[tile]=data;
     }
     const auto after=state_digest(working); std::string error;
-    if(!append_commit(tick_+1,before,after,error)) throw std::runtime_error(error);
+    if(!append_commit(tick_+1,original,working,before,after,error)) throw std::runtime_error(error);
     if(!verifier_.record(tick_+1,after)) throw std::runtime_error("verifier rejected tick sequence");
     state_=std::move(working); ++tick_; last_digest_=after;
     result.ok=true; result.tick=tick_; result.digest=after; return result;
   } catch(const std::exception& e) { result.error=e.what(); result.digest=before; return result; }
 }
 } // namespace axiom
+
 ```
 
 ## Tests
 
-**Repository path:** `engine/tests/test_axiom.cpp`
-
 ```cpp
 #include "axiom/axiom_core.hpp"
+#include "axiom/tile_cache.hpp"
 #include <cassert>
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 #include <stdexcept>
 using namespace axiom;
 int main() {
@@ -279,18 +534,38 @@ int main() {
   std::string error; assert(engine.build_graph({b,a},error));
   auto r=engine.execute_tick(); assert(r.ok && r.tick==1 && engine.verify());
   Tile got{}; assert(engine.get_tile(1,got) && got[0]==4); assert(engine.get_tile(2,got) && got[0]==8);
+  {
+    AxiomEngine restarted(root);
+    assert(restarted.current_tick()==1 && restarted.verify());
+    Tile persisted{}; assert(restarted.get_tile(1,persisted) && persisted[0]==4);
+    assert(restarted.get_tile(2,persisted) && persisted[0]==8);
+  }
+  {
+    std::ofstream torn(root/"axiom.wal",std::ios::binary|std::ios::app);
+    torn.write("AXW",3);
+  }
+  {
+    AxiomEngine repaired(root);
+    assert(repaired.current_tick()==1 && repaired.verify());
+  }
   Task bad{30,{}, {}, {1}, [](const State&, State&){ throw std::runtime_error("intentional failure"); }};
   assert(engine.build_graph({bad},error)); auto before=engine.state().at(1); auto failed=engine.execute_tick();
   assert(!failed.ok && engine.current_tick()==1 && engine.state().at(1)==before);
   Task c{40,{41},{},{},[](const State&,State&){}}; Task d{41,{40},{},{},[](const State&,State&){ }};
   assert(!engine.build_graph({c,d},error)); assert(error.find("cycle")!=std::string::npos);
-  std::cout<<"AXIOM core tests passed\n";
+  TileCache cache(2); Tile x{},y{},z{}; x[0]=1; y[0]=2; z[0]=3;
+  assert(cache.put(1,x) && cache.put(2,y));
+  assert(cache.pin(1)); assert(cache.get(2,got) && got[0]==2);
+  assert(cache.put(3,z)); assert(!cache.contains(2) && cache.contains(1) && cache.contains(3));
+  assert(cache.pin(3)); assert(!cache.put(4,x));
+  assert(cache.unpin(1)); assert(cache.put(4,x));
+  assert(cache.size()==2 && cache.contains(3) && cache.contains(4));
+  std::cout<<"AXIOM core tests passed\\n";
 }
+
 ```
 
-## GitHub Actions build
-
-**Repository path:** `.github/workflows/axiom-cpp.yml`
+## GitHub Actions workflow
 
 ```yaml
 name: AXIOM C++20 Build
@@ -325,4 +600,6 @@ jobs:
         with:
           name: axiom-cpp-core-linux
           path: engine/build/test_axiom
+
 ```
+
