@@ -1,7 +1,10 @@
 #include "axiom/axiom_core.hpp"
 #include <algorithm>
+#include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <openssl/sha.h>
 #include <sstream>
 #include <stdexcept>
@@ -9,6 +12,36 @@
 #include <unistd.h>
 
 namespace axiom {
+namespace {
+constexpr std::array<std::uint8_t,8> WAL_MAGIC{'A','X','W','A','L','0','0','1'};
+void put_u64(std::vector<std::uint8_t>& out, std::uint64_t v) {
+  for (int i=0;i<8;++i) out.push_back(static_cast<std::uint8_t>(v>>(i*8)));
+}
+std::uint64_t get_u64(const std::uint8_t* p) {
+  std::uint64_t v=0; for(int i=0;i<8;++i) v|=std::uint64_t(p[i])<<(i*8); return v;
+}
+std::uint32_t crc32c(const std::uint8_t* data, std::size_t n) {
+  std::uint32_t crc=~std::uint32_t{0};
+  for(std::size_t i=0;i<n;++i) {
+    crc^=data[i];
+    for(int b=0;b<8;++b) crc=(crc>>1)^(0x82f63b78u & (0u-(crc&1u)));
+  }
+  return ~crc;
+}
+void put_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
+  for(int i=0;i<4;++i) out.push_back(static_cast<std::uint8_t>(v>>(i*8)));
+}
+bool write_all(int fd,const std::uint8_t* p,std::size_t n) {
+  std::size_t done=0;
+  while(done<n) {
+    auto w=::write(fd,p+done,n-done);
+    if(w<0) { if(errno==EINTR) continue; return false; }
+    if(w==0) return false;
+    done+=static_cast<std::size_t>(w);
+  }
+  return true;
+}
+}
 Digest sha256(const std::uint8_t* data, std::size_t size) {
   Digest out{}; SHA256(data, size, out.data()); return out;
 }
@@ -52,6 +85,8 @@ AxiomEngine::AxiomEngine(std::filesystem::path storage_root) : root_(std::move(s
   if (!root_.empty()) {
     std::error_code ec; std::filesystem::create_directories(root_, ec);
     if(ec) throw std::runtime_error("cannot create storage root: "+ec.message());
+    std::string error;
+    if(!recover(error)) throw std::runtime_error("AXIOM WAL recovery failed: "+error);
   }
   last_digest_=state_digest(state_);
 }
@@ -94,20 +129,87 @@ bool AxiomEngine::build_graph(const std::vector<Task>& tasks, std::string& error
   }
   tasks_=tasks; return true;
 }
-bool AxiomEngine::append_commit(std::uint64_t tick,const Digest& before,const Digest& after,std::string& error) {
-  if(root_.empty()) return true;
-  const auto path=root_/"commits.log";
-  int fd=::open(path.c_str(),O_CREAT|O_WRONLY|O_APPEND,0644);
-  if(fd<0) { error="open commit log failed"; return false; }
-  std::ostringstream line; line<<tick<<' '<<hex(before)<<' '<<hex(after)<<'\n'; auto s=line.str();
-  std::size_t done=0;
-  while(done<s.size()) {
-    auto n=::write(fd,s.data()+done,s.size()-done);
-    if(n<0) { ::close(fd); error="write commit log failed"; return false; }
-    done+=static_cast<std::size_t>(n);
+bool AxiomEngine::recover(std::string& error) {
+  error.clear();
+  const auto path=root_/"axiom.wal";
+  std::ifstream in(path,std::ios::binary);
+  if(!in) {
+    if(!std::filesystem::exists(path)) return true;
+    error="cannot open WAL"; return false;
   }
-  if(::fsync(fd)!=0) { ::close(fd); error="fsync commit log failed"; return false; }
-  if(::close(fd)!=0) { error="close commit log failed"; return false; }
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),{});
+  std::size_t pos=0,valid_end=0;
+  State recovered;
+  std::uint64_t recovered_tick=0;
+  ZeroVerifier recovered_verifier;
+  while(pos<bytes.size()) {
+    constexpr std::size_t fixed=8+8+32+32+8;
+    if(bytes.size()-pos<fixed) break;
+    const auto* p=bytes.data()+pos;
+    if(!std::equal(WAL_MAGIC.begin(),WAL_MAGIC.end(),p)) break;
+    const auto tick=get_u64(p+8);
+    Digest before{},after{};
+    std::copy(p+16,p+48,before.begin()); std::copy(p+48,p+80,after.begin());
+    const auto count=get_u64(p+80);
+    if(count>(std::numeric_limits<std::size_t>::max()-fixed-4)/(8+TILE_BYTES)) break;
+    const std::size_t record_size=fixed+static_cast<std::size_t>(count)*(8+TILE_BYTES)+4;
+    if(bytes.size()-pos<record_size) break;
+    const auto stored_crc=static_cast<std::uint32_t>(bytes[pos+record_size-4]) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-3])<<8) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-2])<<16) |
+      (static_cast<std::uint32_t>(bytes[pos+record_size-1])<<24);
+    if(crc32c(p,record_size-4)!=stored_crc || tick!=recovered_tick+1 || state_digest(recovered)!=before) break;
+    State next=recovered;
+    std::size_t off=pos+fixed;
+    bool malformed=false;
+    for(std::uint64_t i=0;i<count;++i) {
+      const auto id=get_u64(bytes.data()+off); off+=8;
+      Tile tile{}; std::copy(bytes.begin()+static_cast<std::ptrdiff_t>(off),
+                             bytes.begin()+static_cast<std::ptrdiff_t>(off+TILE_BYTES),tile.begin());
+      off+=TILE_BYTES;
+      if(!next.emplace(id,tile).second) {
+        // A WAL record may update an existing tile.
+        next[id]=tile;
+      }
+    }
+    if(state_digest(next)!=after || !recovered_verifier.record(tick,after)) { malformed=true; }
+    if(malformed) break;
+    recovered=std::move(next); recovered_tick=tick; pos+=record_size; valid_end=pos;
+  }
+  if(valid_end<bytes.size()) {
+    int fd=::open(path.c_str(),O_WRONLY);
+    if(fd<0) { error="cannot open torn WAL for truncation"; return false; }
+    const bool ok=::ftruncate(fd,static_cast<off_t>(valid_end))==0 && ::fsync(fd)==0;
+    const int close_result=::close(fd);
+    if(!ok || close_result!=0) { error="failed to truncate torn WAL tail"; return false; }
+  }
+  state_=std::move(recovered); tick_=recovered_tick; verifier_=std::move(recovered_verifier);
+  last_digest_=state_digest(state_);
+  return true;
+}
+bool AxiomEngine::append_commit(std::uint64_t tick,const State& before_state,const State& after_state,
+                                const Digest& before,const Digest& after,std::string& error) {
+  if(root_.empty()) return true;
+  std::vector<std::uint8_t> record;
+  record.insert(record.end(),WAL_MAGIC.begin(),WAL_MAGIC.end()); put_u64(record,tick);
+  record.insert(record.end(),before.begin(),before.end()); record.insert(record.end(),after.begin(),after.end());
+  std::vector<std::pair<std::uint64_t,const Tile*>> changed;
+  for(const auto& [id,tile]:after_state) {
+    auto old=before_state.find(id);
+    if(old==before_state.end() || old->second!=tile) changed.emplace_back(id,&tile);
+  }
+  put_u64(record,changed.size());
+  for(const auto& [id,tile]:changed) {
+    put_u64(record,id); record.insert(record.end(),tile->begin(),tile->end());
+  }
+  put_u32(record,crc32c(record.data(),record.size()));
+  const auto path=root_/"axiom.wal";
+  int fd=::open(path.c_str(),O_CREAT|O_WRONLY|O_APPEND,0644);
+  if(fd<0) { error="open WAL failed"; return false; }
+  const bool wrote=write_all(fd,record.data(),record.size());
+  const bool synced=wrote && ::fsync(fd)==0;
+  const int closed=::close(fd);
+  if(!wrote || !synced || closed!=0) { error="WAL write/fsync/close failed"; return false; }
   return true;
 }
 TickResult AxiomEngine::execute_tick() {
@@ -127,7 +229,7 @@ TickResult AxiomEngine::execute_tick() {
       for(auto& [tile,data]:writes) working[tile]=data;
     }
     const auto after=state_digest(working); std::string error;
-    if(!append_commit(tick_+1,before,after,error)) throw std::runtime_error(error);
+    if(!append_commit(tick_+1,original,working,before,after,error)) throw std::runtime_error(error);
     if(!verifier_.record(tick_+1,after)) throw std::runtime_error("verifier rejected tick sequence");
     state_=std::move(working); ++tick_; last_digest_=after;
     result.ok=true; result.tick=tick_; result.digest=after; return result;
