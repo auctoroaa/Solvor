@@ -1,6 +1,5 @@
 #include "axiom/axiom_core.hpp"
 #include "axiom/tile_cache.hpp"
-#include "axiom/tile_cache.hpp"
 #include <cassert>
 #include <filesystem>
 #include <iostream>
