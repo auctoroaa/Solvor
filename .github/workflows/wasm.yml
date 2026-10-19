@@ -1,0 +1,64 @@
+name: AXIOM WebAssembly
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Install wasm-bindgen CLI and Binaryen
+        run: |
+          cargo install wasm-bindgen-cli --locked
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+
+      - name: Compile both crates for WebAssembly
+        run: cargo build --workspace --target wasm32-unknown-unknown --release
+
+      - name: Generate browser bindings
+        run: |
+          mkdir -p dist/axiom dist/verifier
+          wasm-bindgen --target web --out-dir dist/axiom --out-name axiom_core target/wasm32-unknown-unknown/release/axiom_core.wasm
+          wasm-bindgen --target web --out-dir dist/verifier --out-name verifier target/wasm32-unknown-unknown/release/zero_verifier.wasm
+
+      - name: Optimize WebAssembly
+        run: |
+          wasm-opt dist/axiom/axiom_core_bg.wasm -O4 -o dist/axiom/axiom_core_opt.wasm
+          wasm-opt dist/verifier/verifier_bg.wasm -O4 -o dist/verifier/verifier_opt.wasm
+
+      - name: Verify outputs
+        run: |
+          test -s dist/axiom/axiom_core.d.ts
+          test -s dist/axiom/axiom_core_opt.wasm
+          test -s dist/verifier/verifier.d.ts
+          test -s dist/verifier/verifier_opt.wasm
+          sha256sum dist/axiom/axiom_core_opt.wasm dist/verifier/verifier_opt.wasm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axiom-wasm-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
