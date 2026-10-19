@@ -1,0 +1,32 @@
+name: AXIOM C++20 Build
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - '.github/workflows/axiom-cpp.yml'
+  pull_request:
+    paths:
+      - 'engine/**'
+      - '.github/workflows/axiom-cpp.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ build dependencies
+        run: sudo apt-get update && sudo apt-get install --yes cmake g++ libssl-dev
+      - name: Configure
+        run: cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
+      - name: Compile
+        run: cmake --build engine/build --parallel 2
+      - name: Test
+        run: ctest --test-dir engine/build --output-on-failure
+      - name: Upload test executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: axiom-cpp-core-linux
+          path: engine/build/test_axiom
