@@ -1,7 +1,8 @@
 #include "axiom/axiom_core.hpp"
 #include <cassert>
 #include <filesystem>
-#include <iostream>\n#include <fstream>
+#include <iostream>
+#include <fstream>
 #include <stdexcept>
 using namespace axiom;
 int main() {
