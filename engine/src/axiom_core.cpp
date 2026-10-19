@@ -1,5 +1,6 @@
 #include "axiom/axiom_core.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -142,6 +143,28 @@ bool AxiomEngine::build_graph(const std::vector<Task>& tasks, std::string& error
     for(auto i:layer) { used[i]=true; ++processed; for(auto child:children[i]) --indegree[child]; }
   }
   tasks_=tasks; return true;
+}
+bool AxiomEngine::persist_genesis(std::string& error) const {
+  error.clear();
+  std::vector<std::uint8_t> bytes;
+  bytes.insert(bytes.end(),GEN_MAGIC.begin(),GEN_MAGIC.end()); put_u64(bytes,state_.size());
+  for(const auto& [id,tile]:state_) {
+    put_u64(bytes,id); bytes.insert(bytes.end(),tile.begin(),tile.end());
+  }
+  put_u32(bytes,crc32c(bytes.data(),bytes.size()));
+  const auto path=root_/"axiom.genesis";
+  const auto temp=root_/"axiom.genesis.tmp";
+  int fd=::open(temp.c_str(),O_CREAT|O_TRUNC|O_WRONLY,0644);
+  if(fd<0) { error="open genesis temp failed"; return false; }
+  const bool wrote=write_all(fd,bytes.data(),bytes.size());
+  const bool synced=wrote && ::fsync(fd)==0;
+  const int closed=::close(fd);
+  if(!wrote || !synced || closed!=0) { error="write/fsync genesis failed"; return false; }
+  std::error_code ec; std::filesystem::rename(temp,path,ec);
+  if(ec) { error="rename genesis failed: "+ec.message(); return false; }
+  int dirfd=::open(root_.c_str(),O_RDONLY|O_DIRECTORY);
+  if(dirfd>=0) { const bool ok=::fsync(dirfd)==0; ::close(dirfd); if(!ok) { error="fsync genesis directory failed"; return false; } }
+  return true;
 }
 bool AxiomEngine::recover(std::string& error) {
   error.clear();
