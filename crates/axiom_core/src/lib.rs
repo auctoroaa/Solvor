@@ -8,7 +8,7 @@ pub fn axiom_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Returns the WGSL source for browser-side WebGPU compilation.
+/// Returns WGSL source for browser-side WebGPU compilation.
 #[wasm_bindgen]
 pub fn shader_source() -> String {
     SHADER_SOURCE.to_owned()
