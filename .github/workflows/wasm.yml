@@ -1,0 +1,46 @@
+name: AXIOM WASM Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wasm-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install Binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binaryen
+      - name: Compile Rust crates to WASM
+        run: cargo build --workspace --target wasm32-unknown-unknown --release
+      - name: Optimize WASM modules
+        run: |
+          wasm-opt target/wasm32-unknown-unknown/release/axiom_core.wasm -O4 -o target/axiom_core_opt.wasm
+          wasm-opt target/wasm32-unknown-unknown/release/zero_verifier.wasm -O4 -o target/zero_verifier_opt.wasm
+      - name: Verify output files
+        run: |
+          test -s target/axiom_core_opt.wasm
+          test -s target/zero_verifier_opt.wasm
+          test -s web/axiom_core.d.ts
+          test -s web/zero_verifier.d.ts
+          wasm-opt target/axiom_core_opt.wasm --validate
+          wasm-opt target/zero_verifier_opt.wasm --validate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axiom-wasm-build
+          path: |
+            target/axiom_core_opt.wasm
+            target/zero_verifier_opt.wasm
+            web/axiom_core.d.ts
+            web/zero_verifier.d.ts
+            src/shaders/axiom.wgsl
