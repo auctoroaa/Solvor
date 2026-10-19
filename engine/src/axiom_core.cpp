@@ -145,15 +145,43 @@ bool AxiomEngine::build_graph(const std::vector<Task>& tasks, std::string& error
 }
 bool AxiomEngine::recover(std::string& error) {
   error.clear();
+  State genesis;
+  const auto genesis_path=root_/"axiom.genesis";
+  if(std::filesystem::exists(genesis_path)) {
+    std::ifstream gen(genesis_path,std::ios::binary);
+    if(!gen) { error="cannot open genesis state"; return false; }
+    std::vector<std::uint8_t> data((std::istreambuf_iterator<char>(gen)),{});
+    constexpr std::size_t header=16, entry=8+TILE_BYTES, trailer=4;
+    if(data.size()<header+trailer || !std::equal(GEN_MAGIC.begin(),GEN_MAGIC.end(),data.begin())) {
+      error="invalid genesis header"; return false;
+    }
+    const auto count=get_u64(data.data()+8);
+    if(count>(std::numeric_limits<std::size_t>::max()-header-trailer)/entry ||
+       data.size()!=header+static_cast<std::size_t>(count)*entry+trailer) {
+      error="invalid genesis length"; return false;
+    }
+    const auto n=data.size();
+    const auto stored=static_cast<std::uint32_t>(data[n-4]) |
+      (static_cast<std::uint32_t>(data[n-3])<<8) |
+      (static_cast<std::uint32_t>(data[n-2])<<16) |
+      (static_cast<std::uint32_t>(data[n-1])<<24);
+    if(crc32c(data.data(),n-4)!=stored) { error="genesis CRC32C mismatch"; return false; }
+    std::size_t off=header;
+    for(std::uint64_t i=0;i<count;++i) {
+      const auto id=get_u64(data.data()+off); off+=8;
+      Tile tile{}; std::copy(data.begin()+static_cast<std::ptrdiff_t>(off),
+                             data.begin()+static_cast<std::ptrdiff_t>(off+TILE_BYTES),tile.begin());
+      off+=TILE_BYTES;
+      if(!genesis.emplace(id,tile).second) { error="duplicate tile in genesis"; return false; }
+    }
+  }
   const auto path=root_/"axiom.wal";
   std::ifstream in(path,std::ios::binary);
-  if(!in) {
-    if(!std::filesystem::exists(path)) return true;
-    error="cannot open WAL"; return false;
-  }
-  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),{});
+  std::vector<std::uint8_t> bytes;
+  if(in) bytes.assign(std::istreambuf_iterator<char>(in),{});
+  else if(std::filesystem::exists(path)) { error="cannot open WAL"; return false; }
   std::size_t pos=0,valid_end=0;
-  State recovered;
+  State recovered=genesis;
   std::uint64_t recovered_tick=0;
   ZeroVerifier recovered_verifier;
   while(pos<bytes.size()) {
@@ -172,22 +200,17 @@ bool AxiomEngine::recover(std::string& error) {
       (static_cast<std::uint32_t>(bytes[pos+record_size-3])<<8) |
       (static_cast<std::uint32_t>(bytes[pos+record_size-2])<<16) |
       (static_cast<std::uint32_t>(bytes[pos+record_size-1])<<24);
-    if(crc32c(p,record_size-4)!=stored_crc || tick!=recovered_tick+1 || state_digest(recovered)!=before) break;
+    if(crc32c(p,record_size-4)!=stored_crc || tick!=recovered_tick+1 ||
+       state_digest(recovered)!=before) break;
     State next=recovered;
     std::size_t off=pos+fixed;
-    bool malformed=false;
     for(std::uint64_t i=0;i<count;++i) {
       const auto id=get_u64(bytes.data()+off); off+=8;
       Tile tile{}; std::copy(bytes.begin()+static_cast<std::ptrdiff_t>(off),
                              bytes.begin()+static_cast<std::ptrdiff_t>(off+TILE_BYTES),tile.begin());
-      off+=TILE_BYTES;
-      if(!next.emplace(id,tile).second) {
-        // A WAL record may update an existing tile.
-        next[id]=tile;
-      }
+      off+=TILE_BYTES; next[id]=tile;
     }
-    if(state_digest(next)!=after || !recovered_verifier.record(tick,after)) { malformed=true; }
-    if(malformed) break;
+    if(state_digest(next)!=after || !recovered_verifier.record(tick,after)) break;
     recovered=std::move(next); recovered_tick=tick; pos+=record_size; valid_end=pos;
   }
   if(valid_end<bytes.size()) {
