@@ -36,5 +36,12 @@ int main() {
   assert(!failed.ok && engine.current_tick()==1 && engine.state().at(1)==before);
   Task c{40,{41},{},{},[](const State&,State&){}}; Task d{41,{40},{},{},[](const State&,State&){ }};
   assert(!engine.build_graph({c,d},error)); assert(error.find("cycle")!=std::string::npos);
-  std::cout<<"AXIOM core tests passed\n";
+  TileCache cache(2); Tile x{},y{},z{}; x[0]=1; y[0]=2; z[0]=3;
+  assert(cache.put(1,x) && cache.put(2,y));
+  assert(cache.pin(1)); assert(cache.get(2,got) && got[0]==2);
+  assert(cache.put(3,z)); assert(!cache.contains(2) && cache.contains(1) && cache.contains(3));
+  assert(cache.pin(3)); assert(!cache.put(4,x));
+  assert(cache.unpin(1)); assert(cache.put(4,x));
+  assert(cache.size()==2 && cache.contains(3) && cache.contains(4));
+  std::cout<<"AXIOM core tests passed\\n";
 }
