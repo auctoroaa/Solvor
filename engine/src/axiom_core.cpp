@@ -14,6 +14,7 @@
 namespace axiom {
 namespace {
 constexpr std::array<std::uint8_t,8> WAL_MAGIC{'A','X','W','A','L','0','0','1'};
+constexpr std::array<std::uint8_t,8> GEN_MAGIC{'A','X','G','E','N','0','0','1'};
 void put_u64(std::vector<std::uint8_t>& out, std::uint64_t v) {
   for (int i=0;i<8;++i) out.push_back(static_cast<std::uint8_t>(v>>(i*8)));
 }
@@ -90,7 +91,20 @@ AxiomEngine::AxiomEngine(std::filesystem::path storage_root) : root_(std::move(s
   }
   last_digest_=state_digest(state_);
 }
-void AxiomEngine::set_tile(std::uint64_t id, const Tile& tile) { state_[id]=tile; last_digest_=state_digest(state_); }
+void AxiomEngine::set_tile(std::uint64_t id, const Tile& tile) {
+  auto previous=state_.find(id);
+  const bool existed=previous!=state_.end();
+  Tile old{}; if(existed) old=previous->second;
+  state_[id]=tile;
+  if(!root_.empty() && tick_==0) {
+    std::string error;
+    if(!persist_genesis(error)) {
+      if(existed) state_[id]=old; else state_.erase(id);
+      throw std::runtime_error("persist genesis failed: "+error);
+    }
+  }
+  last_digest_=state_digest(state_);
+}
 bool AxiomEngine::get_tile(std::uint64_t id, Tile& out) const {
   auto it=state_.find(id); if(it==state_.end()) return false; out=it->second; return true;
 }
