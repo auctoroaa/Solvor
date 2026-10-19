@@ -25,6 +25,8 @@ jobs:
           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
+      - name: Run native unit tests
+        run: cargo test --workspace
       - name: Install wasm-bindgen CLI and Binaryen
         run: |
           cargo install wasm-bindgen-cli --locked
