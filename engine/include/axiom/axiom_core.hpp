@@ -57,6 +57,7 @@ class AxiomEngine {
   Digest last_digest_{};
   ZeroVerifier verifier_;
   bool recover(std::string& error);
+  bool persist_genesis(std::string& error) const;
   bool append_commit(std::uint64_t tick, const State& before_state, const State& after_state,
                      const Digest& before, const Digest& after, std::string& error);
 };
