@@ -8,17 +8,17 @@ cmake --build engine/build --parallel
 ctest --test-dir engine/build --output-on-failure
 ```
 
-## Implemented and tested
+## Implemented
 
 - Deterministic DAG layering and stable task ordering.
 - Declared tile-access conflict checks and transactional tick updates.
 - Rollback when a task fails before commit.
 - SHA-256 state digests and a deterministic hash-chain verifier.
-- CRC32C-protected binary write-ahead log records with fsync before a tick is accepted.
-- CRC32C-protected, atomically replaced genesis state for initial tiles.
-- Restart recovery that validates tick order, before/after state digests, record CRCs, and truncates an incomplete or invalid WAL tail.
-- Bounded LRU `TileCache` primitive with pin-aware eviction and tests.
+- CRC32C-protected binary write-ahead log records, synced before a tick is accepted.
+- CRC32C-protected genesis tile state, atomically replaced and synced.
+- Restart recovery validating tick order, before/after state digests and record CRCs; invalid/torn WAL tail is truncated.
+- Bounded LRU tile-cache primitive with pin-aware eviction.
 
-## Remaining integration work
+## Still unfinished
 
-The cache is currently a tested primitive, not yet the engine's backing store. The engine still keeps its active state in an in-memory map. WAL segment rotation, a complete StatePager that pages state through the bounded cache, optional io_uring I/O, and broader fault-injection/concurrency testing remain unfinished. Do not treat this as the complete production AXIOM Reality Engine yet.
+The cache is a tested primitive, not yet the engine's backing store. Active state remains in an in-memory map. WAL segment rotation, a StatePager integrated with the cache, optional io_uring I/O, and broader fault-injection/concurrency testing remain unfinished. This is not yet the complete production AXIOM Reality Engine.
